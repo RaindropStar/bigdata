@@ -1,0 +1,224 @@
+#!/usr/bin/python
+# -*- encoding:utf-8 -*-
+
+"""
+@author:jmzhang
+@file:.py
+@topic:
+"""
+import time
+from pyspark.ml.classification import NaiveBayes, sys
+from pyspark.ml.clustering import KMeans
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.ml import Pipeline
+from pyspark.ml.classification import DecisionTreeClassifier
+from pyspark.ml.feature import StringIndexer, VectorIndexer
+from pyspark.ml.linalg import Vectors
+from pyspark.sql import SparkSession
+from spyne import Application, rpc, ServiceBase, String
+from spyne import Integer, Unicode, Array, ComplexModel
+from spyne import srpc
+from spyne.protocol.soap import Soap11
+from spyne.server.wsgi import WsgiApplication
+from wsgiref.simple_server import make_server
+from pyspark.sql import Row
+import logging
+
+
+class KMeansClusterAnalysis(ServiceBase):
+    @srpc(String, String, _returns=String)
+    def kmeans_cluster_analysis(table_name, number):
+        number_int =int(number)
+        warehouse_location = 'spark-warehouse'
+        spark = SparkSession \
+            .builder \
+            .appName("KMeansExample") \
+            .config("spark.sql.warehouse.dir", warehouse_location) \
+            .enableHiveSupport() \
+            .getOrCreate()
+
+        # Loads data from  hive
+        spark.sql("use testdatabase")
+        value = spark.sql(str("select * from  %s " % (table_name)))
+        data = value.rdd.map(lambda x: (x[0], Vectors.dense(x[1:]))).toDF(['label', 'features'])
+        # Trains a k-means model.
+        kmeans = KMeans().setK(number_int).setSeed(1)
+        model = kmeans.fit(data)
+
+        # Evaluate clustering by computing Within Set Sum of Squared Errors.
+        wssse = model.computeCost(data)
+        print("Within Set Sum of Squared Errors = " + str(wssse))
+
+        # centers = model.clusterCenters() #聚类的中心点
+        # 获取percent信息
+        value = model.transform(data)
+        key_dataframe = value.select(value.prediction).rdd.map(lambda x: [x.prediction, 1]).reduceByKey(
+            lambda a, b: a + b).toDF(['group', 'number'])
+        all_dataframe = value.select(value.prediction).rdd.count()
+        percent = key_dataframe.rdd.map(lambda x: (x.group, (x.number) / (all_dataframe * 1.0), x.number)).toDF(
+            ['group', 'percent', 'number']).toJSON(['result']).collect()
+
+        # 获取Aggre信息
+        aggre = value.select("prediction", "features") \
+            .rdd.map(lambda x: (x.prediction,) + tuple(x.features.toArray().tolist())).toDF(
+            ['result']).toJSON().collect()
+
+        # print("Cluster Centers: ")
+        # for center in centers:
+        #     print(center)
+
+        spark.stop()
+
+        message = '''
+             {
+             "State":"Complete",
+             "Precet":%s,
+             "Aggre":%s,
+             "Message":"Don't Worry!"
+             }
+              ''' % (percent, aggre)
+
+        return message
+class NaiveBayesClassifyService(ServiceBase):
+    @srpc(String,String,_returns=String)
+    def naive_bayes_classify(table_name, feature_list):
+        warehouse_location = 'spark-warehouse'
+
+        spark = SparkSession \
+            .builder \
+            .master("local[*]") \
+            .appName("NaiveBayesAnalysisModel") \
+            .config("spark.sql.warehouse.dir", warehouse_location) \
+            .enableHiveSupport() \
+            .getOrCreate()
+
+        spark.sql("use testdatabase")
+        value = spark.sql(str("select label,v1,v2,v3,v4,v5,v6,v7 from  %s " % (table_name)))
+        # 第一种
+        data = value.rdd.map(lambda x: (x[0], Vectors.dense(x[1:]))).toDF(['label', 'features'])
+
+        # create the trainer and set its parameters
+        nb = NaiveBayes(smoothing=1.0, modelType="multinomial")
+
+        splits = data.randomSplit([0.6, 0.4], 1234)
+        train = splits[0]
+        test = splits[1]
+
+        # train the model
+        model = nb.fit(train)
+        predictions = model.transform(test)
+        # predictions.show()
+
+        # 新的数据进行测试
+        data_str = str(feature_list).split(",")  # 切分string的f1,f2,f3 ...fn的数据
+        data_int = map(eval, data_str)  # 将list中的数据类型由string换成int
+        prediction_data = spark.sparkContext.parallelize([Row(feature=Vectors.dense(data_int))]).toDF(['features'])
+
+        # 数据放入模型
+        prediction_result = model.transform(prediction_data)
+        # prediction_result.show()
+
+        # probability = prediction_result.select("probability").rdd.map(lambda x: x.probability.tolist()).collect()
+        # prediction = prediction_result.select(prediction_result.prediction).rdd.map(lambda x: x.prediction).collect()
+
+        probability = prediction_result.select("probability").rdd.map(lambda x:tuple(x.probability.toArray().tolist())).toDF(['probability']).toJSON().collect()
+        prediction = prediction_result.select("prediction").toJSON().collect()
+
+
+        # compute accuracy on the test set
+        evaluator = MulticlassClassificationEvaluator(labelCol="label", predictionCol="prediction",
+                                                      metricName="accuracy")
+        accuracy = evaluator.evaluate(predictions)
+        # print("Test set accuracy = " + str(accuracy))
+
+        spark.stop()
+        message = '''
+        {
+        "State":"Complete",
+        "PredClass":%s,
+        "probability":%s,
+        "Message":"Don't Worry!"
+        }
+         ''' % (prediction, probability)
+
+        return message
+class DecisionTreeClassifyService(ServiceBase):
+    @srpc(String, String, _returns=String)
+    def decision_tree_classify(table_name, feature_list):
+        spark = SparkSession \
+            .builder \
+            .master("local[*]") \
+            .appName("DecisionTreeClassificationWebservice") \
+            .enableHiveSupport() \
+            .getOrCreate()
+
+        spark.sql("use testdatabase")
+        value = spark.sql(str("select label,v1,v2,v3,v4,v5,v6,v7  from  %s " % (table_name)))
+        # 第一种
+        data = value.rdd.map(lambda x: (x[0], Vectors.dense(x[1:]))).toDF(['label', 'features'])
+
+        # Index labels, adding metadata to the label column.
+        # Fit on whole dataset to include all labels in index.
+        labelIndexer = StringIndexer(inputCol="label", outputCol="indexedLabel").fit(data)
+        # Automatically identify categorical features, and index them.
+        # We specify maxCategories so features with > 4 distinct values are treated as continuous.
+        featureIndexer = \
+            VectorIndexer(inputCol="features", outputCol="indexedFeatures", maxCategories=4).fit(data)
+
+        # Split the data into training and test sets (30% held out for testing)
+        (trainingData, testData) = data.randomSplit([0.7, 0.3])
+
+        # Train a DecisionTree model.
+        # dt = DecisionTreeClassifier(labelCol="indexedLabel", featuresCol="indexedFeatures")
+        dt = DecisionTreeClassifier(labelCol="indexedLabel")
+
+        # Chain indexers and tree in a Pipeline
+        # pipeline = Pipeline(stages=[labelIndexer,indexedLabel, dt])
+        pipeline = Pipeline(stages=[labelIndexer, dt])
+
+        # Train model.  This also runs the indexers.
+        model = pipeline.fit(trainingData)
+
+        # Make predictions.
+        predictions = model.transform(testData)
+
+        # 对输入的数据进行转换
+        data_str = feature_list.split(",")  # 切分string的f1,f2,f3 ...fn的数据
+        data_int = map(eval, data_str)  # 将list中的数据类型由string换成int
+        prediction_data = spark.sparkContext.parallelize([Row(feature=Vectors.dense(data_int))]).toDF(['features'])
+
+        # 数据放入模型进行预测
+        prediction_result = model.transform(prediction_data).select("prediction").toJSON(['result']).collect()
+        spark.stop()
+        message = '''
+           {
+           "State":"Complete",
+           "PredClass":%s,
+           "Message":"Don't Worry!"
+           }
+            ''' % (prediction_result)
+
+        return message
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.ERROR)
+    logging.getLogger('spyne.protocol.xml').setLevel(logging.ERROR)
+
+    app = Application([KMeansClusterAnalysis,NaiveBayesClassifyService,DecisionTreeClassifyService],
+                      'MLModelService',
+                      in_protocol=Soap11(validator='lxml'),
+                      out_protocol=Soap11(),
+                      )
+
+    wsgi_app = WsgiApplication(app)
+
+    server = make_server('172.16.9.191', 8989, wsgi_app)
+
+    print "listening to http://172.16.9.191:8989"
+    print "wsdl is at: http://172.16.9.191:8989/?wsdl"
+
+    server.serve_forever()
+
+
+
