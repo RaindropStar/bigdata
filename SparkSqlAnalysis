@@ -1,0 +1,244 @@
+#!/usr/bin/python
+# -*- encoding:utf-8 -*-
+
+"""
+@author:jmzhang
+@file:.py
+@topic:
+"""
+
+
+#coding=utf-8
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import re
+import sys
+reload(sys)
+sys.setdefaultencoding('utf8')
+
+if __name__ == '__main__':
+    spark = SparkSession \
+        .builder \
+        .master('local[*]')\
+        .appName('11') \
+        .getOrCreate()
+
+    bdcdj = spark.read .option("header","true").csv("file:///F:/data/BDCDJ.csv")
+    bdcqs = spark.read .option("header","true").csv("file:///F:/data/BDC_QS.csv")
+    '''
+    第一步，去除地址信息为空的数据
+    '''
+    bdcdj_addr_not_null = bdcdj.where(bdcdj.ADDRESS != 'null')
+    bdcdj_addr_null = bdcdj.where(bdcdj.ADDRESS == 'null')
+    bdcqs_addr_not_null = bdcqs.where(bdcqs.TDFWDZ != 'null')
+    bdcqs_addr_null = bdcqs.where(bdcqs.TDFWDZ == 'null')
+    '''
+    第二步，区分商业地产和住宅地产
+    '''
+    #选出商业地产
+    bdcdj_company = bdcdj_addr_not_null.where(length(bdcdj.SYQR) >=  4)
+    #选出住宅地产
+    bdcdj_home = bdcdj_addr_not_null.where(length(bdcdj.SYQR) <  4)
+
+    '''
+    第三步，直接根据地址匹配，是最准的数据
+    '''
+    #公司地址进行匹配
+    bdcdj_company_join = bdcdj_company.join(
+        bdcqs_addr_not_null,
+        bdcdj_company.ADDRESS == bdcqs_addr_not_null.TDFWDZ,
+        'inner'
+    )
+    a = bdcdj_company_join.count()
+    print(a)
+
+    #住宅地址进行匹配
+    bdcdj_home_join = bdcdj_home.join(
+        bdcqs_addr_not_null,
+        bdcdj_company.ADDRESS == bdcqs_addr_not_null.TDFWDZ,
+        'inner'
+    )
+
+    b = bdcdj_home_join.count()
+    print(b)
+
+
+    '''
+    第四步，自定义UDF进行地址的格式化，主要针对bdcqs_addr_not_null
+    '''
+    #对search_str字段进行匹配并截取地址字段
+    def address_format(search_str,addr):
+        location = re.search(search_str,addr)
+        if location == None:
+            capture_content = addr
+        else:
+            span = location.span()
+            start, end = span
+            capture_content = addr[end:]
+        return capture_content
+
+    #针对地址进行不同的关键字进行地址字段截取
+    def address(addr):
+        # print(type(addr),"1111")
+        addr_str = addr.encode('utf-8')#Unicode 转换成str
+        # print(type(addr_str),"2222")
+        a = '镇'
+        b = '街道'
+        c = '号'
+        d = '开发区'
+        e = '区'
+
+        a_result = address_format(a,addr_str)
+        b_result = address_format(b,addr_str)
+        c_result = address_format(c,addr_str)
+        d_result = address_format(d,addr_str)
+        e_result = address_format(e, addr_str)
+
+        if c_result != addr_str:
+            result = c_result
+        else:
+            if a_result != addr_str:
+                result = a_result
+            if b_result != addr_str:
+                result = b_result
+            else:
+                if d_result != addr_str:
+                    result = d_result
+                if e_result !=addr_str:
+                    result = d_result
+                else:
+                    result = addr_str
+
+        result_unicode = result.decode('utf-8')#将str转换为unicode
+        # print(type(result_unicode))
+
+
+        return result_unicode
+
+    #创建udf，进行地址截取
+    bdcqs_addr_format = udf(address,StringType())
+    bdcqs_addr_not_null_addr = bdcqs_addr_not_null.select("*",bdcqs_addr_format("TDFWDZ")).toDF("UUID","ZRFMC","ZRF_SFZHM","TDFWDZ","CSFMC","CSF_SFZHM","XGRQ","ADDRESS").show()
+    bdcdj_home_addr  = bdcdj_home.select("*",bdcqs_addr_format("ADDRESS")).toDF("B_GUID","FWID","SYQR","ZJHM","ZT","SQRQ","ADDRESS","FORMAT").show()
+
+
+    '''
+    第五步，根据姓名和地址进行匹配
+    '''
+
+    # bdcdj_home_addr_join = bdcdj_home_addr.join(
+    #     bdcqs_addr_not_null_addr,
+    #     bdcdj_home_addr.FORMAT == bdcqs_addr_not_null_addr.ADDRESS,
+    #     'inner')
+
+    # c= bdcdj_home_addr_join.count()
+    # print(c)
+
+
+    # bdcdj_home_addr_join = bdcdj_home_addr.join(
+    #     bdcqs_addr_not_null,
+    #     bdcdj_home_addr.FORMAT == bdcqs_addr_not_null.TDFWDZ,
+    #     'inner')
+    #
+    # bdcdj_home_addr_join.show()
+
+
+    # print(bdcdj_home_addr_join)
+
+
+    # a = bdcdj_home_addr_join.select("uuid").distinct().count()
+    # print(a)
+
+
+
+    # bdcdj_company_addr_join = bdcdj_company.join(
+    #     bdcqs_addr_not_null,
+    #     bdcdj_company.ADDRESS == bdcqs_addr_not_null.TDFWDZ,
+    #     'inner').show()
+
+
+    # a = bdcdj_home_addr_join.count()
+    # b = bdcqs_addr_not_null.count()
+    # c = bdcqs_addr_null.count()
+    # d = bdcdj_company_addr_join.count()
+    # print(a)
+    # print(d)
+
+
+    # '''
+    # 第三步，取bdcdj_home的ZJHM,统一取到后五位,
+    # bdcqs的ZRF_SFZHM取后五位,
+    # bdcqs的CSF_SFZHM取后五位
+    # '''
+    # #创建udf用于提取证件号码的后5位
+    # get_last_5_number = udf(lambda s:s[-5:], StringType())
+    # #住宅地址的证件号码取到后五位
+    # bdcdj_home_zjhm_last5 = bdcdj_home.select("*",get_last_5_number("ZJHM")).toDF('B_GUID','FWID','SYQR','ZJHM','ZT','SQRQ','ADDRESS','LAST_5')
+    # #bdcqs的ZRF_SFZHM取后五位
+    # bdcqs_zrf_sfzhm_last_5 = bdcqs_addr_not_null.select("*",get_last_5_number("ZRF_SFZHM")).toDF('UUID','ZRFMC','ZRF_SFZHM','TDFWDZ','CSFMC','CSF_SFZHM','XGRQ','LAST_5')
+    # # bdcqs的CSF_SFZHM取后五位
+    # bdcqs_csf_sfzhm_last_5 = bdcqs_addr_not_null.select("*",get_last_5_number("CSF_SFZHM")).toDF('UUID','ZRFMC','ZRF_SFZHM','TDFWDZ','CSFMC','CSF_SFZHM','XGRQ','LAST_5')
+    # #
+    # bdcqs_last_5 = bdcqs_addr_not_null.select("*",get_last_5_number("ZRF_SFZHM"),get_last_5_number("CSF_SFZHM")).toDF('UUID','ZRFMC','ZRF_SFZHM','TDFWDZ','CSFMC','CSF_SFZHM','XGRQ','ZRF_SFZHM_LAST_5','CSF_SFZHM_LAST_5')
+    # '''
+    # 第四步，根据地址进行匹配房屋id
+    # '''
+
+
+
+
+    # '''
+    # 第四步bdcdj_home中的SYQR分别和bdqs中的ZRF_SFZHM和CSF_SFZHM进行Join
+    # '''
+    #
+    # cond = [ bdcdj_home_zjhm_last5.SYQR == bdcqs_zrf_sfzhm_last_5.ZRFMC,
+    #     bdcdj_home_zjhm_last5.LAST_5 == bdcqs_zrf_sfzhm_last_5.LAST_5]
+    #
+    # syqr_home_join_zrf_sfzhm =bdcdj_home_zjhm_last5.join(
+    #     bdcqs_zrf_sfzhm_last_5,
+    #     cond,
+    #     'inner').show()
+    #
+    # # cond1 = [bdcdj_home_zjhm_last5.SYQR == bdcqs_csf_sfzhm_last_5.CSFMC,
+    # #         bdcdj_home_zjhm_last5.LAST_5 == bdcqs_csf_sfzhm_last_5.LAST_5]
+    # #
+    # # syqr_join_csf_sfzhm = bdcdj_home_zjhm_last5.join(
+    # #     bdcqs_csf_sfzhm_last_5,
+    # #     cond1,
+    # #     'inner').show()
+    #
+    # '''
+    # 第五步，对商业住宅进行筛选
+    # '''
+    #
+    # bdcdj_company_join_zrf_sfzhm = bdcdj_company.join(
+    #     bdcqs_zrf_sfzhm_last_5,
+    #     bdcdj_company.SYQR == bdcqs_zrf_sfzhm_last_5.ZRFMC,
+    #     'inner').show()
+    #
+    # bdcdj_company_join_csf_sfzhm = bdcdj_company.join(
+    #     bdcqs_csf_sfzhm_last_5,
+    #     bdcdj_company.SYQR == bdcqs_csf_sfzhm_last_5.CSFMC,
+    #     'inner').show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
